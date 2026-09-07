@@ -1,5 +1,11 @@
 # dsh-agent-checkpoint
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-checkpoint"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 > 存档点管理器：最后的保活机制 + 试错回滚工具。
 > DeepSeek Harness 自研插件 · v0.1.1
 
