@@ -103,16 +103,19 @@
 | A3 | id 形如 `YYYYMMDD-HHmmss-uuid6` | 实测目录名 `20260914-093844-d8db5c` | 已验收 |
 | A4 | 只快照 storages 顶层 `*.json`，不含子目录 | 同一 manifest 无 `storages/session_projcache/sessions/*` 键 | 已验收 |
 | A5 | 清理生效：存档目录数 ≤ `keepCount`(10) | 目录列举恰为 10 个 | 已验收（间接） |
-| A6 | 无自动化回归：插件无单测 | 插件目录无 `tests/`（glob 无命中） | 已验收 |
+| A6 | **具备**自动化回归：`tests/pure.test.mjs` 覆盖决策/校验纯函数 | `npm test` → `tests 23 / pass 23 / fail 0` | 已实测（2026-09-14；本条原判「无 `tests/`」→ 已闭环，见 §9） |
 | A7 | 恢复可逆：覆盖前备份到 `.pre-restore-<stamp>/` | 跑 `checkpoint_restore` → 列 `<checkpointDir>/.pre-restore-*` + 工具返回的 backedUp 计数 | 待验收 |
 | A8 | 显式 id 恢复不做健康校验（可从坏存档恢复） | 手工损坏副本内一个文件 → `checkpoint_restore(id=该点)` → 观察是否仍恢复 | 待验收 |
 | A9 | 启动补档：距最近存档 ≥6h 时进程启动即产出 `reason:"auto"` 存档 | 存档清单新增 `reason` 为 `auto` 且 createdAt ≈ 启动时刻 | 待验收 |
 | A10 | git 保险库联动 best-effort：外呼失败不影响存档 | 改坏 `gitVaultCommand` → `checkpoint_create` 仍返回 ok 且存档落盘 | 待验收 |
-| A11 | 定时器不阻进程退出（`timer.unref?.()`） | 源码 `src/index.ts:358`；无独立运行时测量 | 待验收 |
+| A11 | 定时器不阻进程退出（`timer.unref?.()`） | 源码 `src/index.ts` 的 `timer.unref?.()`；无独立运行时测量 | 待验收 |
+| A12 | 失败/退化路径被机器锁住（S6 判据） | `npm test` → 含损坏 JSON / 截断 JSON / 空存档列表 / 空 id / 时钟回拨 / keep=0 / 白名单拒收 等用例，全绿 | 已实测（2026-09-14，23/23 pass） |
+| A13 | 恢复落点白名单不可逃逸出 `storagesDir` | `npm test` → `restoreDest: 尸体样本…` 断言 `restoreDest('storages/../AGENTS.md.bak') === null`；**修前该用例失败**（实测返回 `\AGENTS.md.bak` = 盘根） | 已实测（2026-09-14，修后 pass） |
+| A14 | 决策逻辑与 IO 分离（可离线单测） | `src/pure.ts` 无 `ctx`/`fs`/`child_process` 导入；`grep -c "from 'node:fs" src/pure.ts` = 0 | 已实测（2026-09-14） |
 
 ## 8 · 与实现的关系
 
-- 实现 = 唯一源文件 `src/index.ts`（365 行）→ `pnpm build`（tsc）→ 产物 `lib/index.js`；profile 以 `"dsh-agent-checkpoint": "link:E:/alice/self-plugins/dsh-agent-checkpoint"` 挂载（`.dsh/profiles/web/package.json:8`），运行时入口 `lib/index.js`。
+- 实现 = `src/index.ts`（装配 + IO 接线：快照/清单/验证/恢复/清理/定时）**+ `src/pure.ts`（纯决策层：路径解析、补档判定、恢复计划、落点白名单、清理切片、storage 结构校验）** → `pnpm build`（tsc）→ 产物 `lib/index.js` + `lib/pure.js`；profile 以 `"dsh-agent-checkpoint": "link:E:/alice/self-plugins/dsh-agent-checkpoint"` 挂载（`.dsh/profiles/web/package.json:8`），运行时入口 `lib/index.js`。
 - **生效判据**（改了代码后怎么证明真的生效）：① 产物 mtime **晚于** `src/index.ts` mtime（证明构建过）；② **进程启动时间 vs `lib/index.js` mtime**——产物更新而进程更早启动即「构建了但没在跑」（web profile HMR root 指向 `E:/alice/self-plugins`，见 `cordis.patch.yml:31-39`，lib 变更会重载该行；否则走 `preflight_check` → `daemon_restart`）；③ 行为判据 = 工具可答（`checkpoint_list` 返回真清单）+ **落盘产物**（新 `<id>/manifest.json` 的 createdAt 与 sha256 与源文件重算值一致）。
 - **回退**：① 代码级——`git -C E:\alice\self-plugins\dsh-agent-checkpoint log --oneline`（当前 HEAD `8b29d0f`，工作树干净）→ `git revert` / `git checkout`；② 数据级——`checkpoint_restore`（id 缺省 = 最近健康点，覆盖前自动写 `.pre-restore-*` 备份，故恢复可逆）；③ 机制级——`plugin_stop dsh-agent-checkpoint`（或 patch 里 `disabled: true`）停用，不影响其它插件与数据。
 - 观测面（`ctx.logger('checkpoint')`）：`checkpoint 就绪：dir=… storages=… keep=…`、`存档 <id>: N 文件 healthy=…`、`清理旧存档 N 个`、`[git-vault] … ✓ / 失败: …`；注意宿主 logger **不落盘**。
@@ -121,12 +124,22 @@
 
 - 2026-09-14 补课：本插件此前无语义文档（可维护性工程）
 - 2026-09-14 补课期间发现三处「文档/注释与实现不符」：README「无效存档不落库」（实现是照落盘、只在日志与返回值标注 healthy）、配置注释「`gitVaultCommand` 与自动存档同节奏」（实现是**每次** create 都触发，含手动与压缩前）、`runGitVault` 的 note 不传 argv——全部记入 §10，本次不改代码。
+- **2026-09-14 · 可维护性补课（S3 有测试 / S6 失败路径）：抽纯逻辑层 + 修一处路径逃逸缺陷**
+  - **抽层（行为不变的搬家）**：新增 `src/pure.ts`，把被困在 `apply()` 闭包里的决策逻辑搬出来——`resolvePaths`（原 apply 顶部三行 resolve）、`formatStamp`（原 `stamp()`）、`validateStorageUnit`（原模块级函数）、`shouldAutoBackfill`（原启动补档的 `last === 0 || elapsed >= interval` 判定）、`planRestore`（原 `restoreCheckpoint` 的目标选择）、`restoreDest`（原恢复循环里的 rel→dst 映射）、`selectStaleCheckpoints`（原 `list.slice(keep)`）、`backupFileName`（原 `rel.replaceAll('/', '__')`）。`index.ts` 只做接线（环境读取/落盘/子进程），**正常路径语义逐条保持**。
+  - **真缺陷（修前已证伪）**：`restoreDest('storages/../AGENTS.md.bak')` 归一化后得到 **盘根 `\AGENTS.md.bak`**——即落在 `storagesDir` 之外。恢复是破坏性动作（覆盖 `AGENTS.md`/记忆库），一个损坏或手工编辑的 `manifest.json` 就能把内容写到工作区任意路径。**证伪证据**：先写尸体用例 `restoreDest: 尸体样本…`，实测失败并打印 `storages/../AGENTS.md.bak 逃逸出 storagesDir: \AGENTS.md.bak`；随后才修。
+  - **修复**：`restoreDest` 收窄白名单——`name` 必须是**纯文件名**（非空、非 `.`/`..`、不含 `\` 与 `/`）。正常 manifest 的 rel 由 `snapshotTargets()` 用 `readdir` 裸文件名拼出，永远不含分隔符 ⇒ **对合法存档零影响**。
+  - **行为变更（显式列出，仅此一条）**：`storages/`（空名字）与 `storages/a/../b.json` 等畸形 rel 由「映射/归一化到某路径」改为「**拒收返回 null = 跳过**」。影响面仅限畸形 manifest；正常存档行为不变。
+  - **语义被补充（新不变量）**：**恢复落点白名单**——`restoreDest` 只认 `storages/<纯文件名>` 与 `AGENTS.md`，其余一律 null。由 `tests/pure.test.mjs` 两条用例（白名单拒收 + 尸体样本）机器锁住。
+  - **教训一（写测试的纪律）**：首版用例把期望路径硬编码成 POSIX 字面量（`'/abs/st'`），本机是 Windows → `resolve('/abs/st')` 实为 `\abs\st`，多条断言假失败。**路径断言必须用 `node:path` 现算**（`join/resolve/sep`），否则测试只在作者那一侧绿。
+  - **教训二**：测试文件是 `.mjs`（纯 JS）——首版误留 TS 语法（`as string`），Node 直接 `SyntaxError` 拒载。`.mjs` 里不写类型断言。
 
 ## 10 · 未决问题
 
 - U1 README「无效存档不落库」与实现不符：`createCheckpoint` 验证后不删除 unhealthy 存档。是改文档还是加拒收？（语义取舍：保活场景宁可有坏存档也不能无存档，需定调）
 - U2 显式 id 恢复无健康校验：是否改为「显式 id 也先 verify，不健康则需 force 才继续」？
 - U3 git 保险库联动语义：note 不传给脚本（提交消息恒为默认时间戳），且每次 create 都触发（压缩前存档亦触发一次 commit）——是否改为「仅 auto 触发」或「note 进 argv」？
-- U4 无任何自动化回归（无 `tests/`）：恢复 / 清理 / 补档三条路径全部只在线上跑，是否补纯函数级单测（把选择目标、备份计划、清理切片抽成决策函数）？
+- U4 **已解决（2026-09-14 补课）**：原「无任何自动化回归（无 `tests/`）」——已建 `tests/pure.test.mjs`（23 例，跑 `lib/` 产物），并把选择目标/补档判定/清理切片/落点映射四类决策抽成 `src/pure.ts` 纯函数。命令：`npm test`。
+- U7 负 `keep` 的破坏性边界（新，2026-09-14 登记）：`cleanupOld` 走 `list.slice(keep)`，`checkpoint_cleanup keep=-5` 且存档数 < 5 时 `slice(-5)` = 全长 ⇒ **一次删光所有存档**。已由 `selectStaleCheckpoints: 文档化 quirk` 用例钉住现状（未改行为）。是否加 clamp（`keep = Math.max(1, keep)`）待定调。
+- U8 `restoreDest` 拒收语义的可见性（新，2026-09-14 登记）：畸形 rel 现在被静默跳过（只体现在恢复结果的 `issues` 之外——它连 issues 都不进）。是否让被拒条目进 `issues`（可观测）待定调。
 - U5 不发布任何事件：外部（守护、面板）无法订阅「存档完成」。是否按 AGENTS §5.22 落一份侧车轨迹（`<DSH_HOME>/checkpoint-trace.jsonl`）自证？
 - U6 保留策略：`keepCount`=10 且按 `createdAt` 字符串降序切片删除，而 `.pre-restore-*` 备份目录**不在**清理范围内 → 备份会无限累积，是否纳入清理？

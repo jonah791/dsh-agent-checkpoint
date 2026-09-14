@@ -11,10 +11,14 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { mkdir, readFile, writeFile, copyFile, readdir, rm, rename } from 'node:fs/promises'
-import { join, dirname, resolve } from 'node:path'
+import { join, dirname } from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { execFile } from 'node:child_process'
+import {
+  backupFileName, formatStamp, planRestore, resolvePaths, restoreDest,
+  selectStaleCheckpoints, shouldAutoBackfill, validateStorageUnit,
+} from './pure.ts'
 
 export const name = 'agent-checkpoint'
 export const inject = ['tools'] as const
@@ -57,20 +61,6 @@ export const Config = z.object({
 
 const sha256 = (data: Buffer | string): string => createHash('sha256').update(data).digest('hex')
 
-/** storage-json unit 结构校验（对齐 storage-json/src/format.ts 的 parse 检查：valid JSON / object / unit header / tables） */
-function validateStorageUnit(text: string): string | null {
-  try {
-    const doc = JSON.parse(text) as unknown
-    if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) return 'not a JSON object'
-    const d = doc as Record<string, unknown>
-    if (typeof d.unit !== 'object' || d.unit === null) return 'missing unit header'
-    if (typeof d.tables !== 'object' || d.tables === null) return 'tables is not an object'
-    return null
-  } catch (err) {
-    return `invalid JSON: ${(err as Error).message}`
-  }
-}
-
 interface Manifest {
   version: number
   id: string
@@ -81,16 +71,11 @@ interface Manifest {
 
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('checkpoint')
-  const dshHome = process.env.DSH_HOME || process.cwd()
-  const checkpointDir = resolve(config.checkpointDir || join(dshHome, 'checkpoints'))
-  const storagesDir = resolve(config.storagesDir || join(dshHome, 'storages'))
-  const soulFile = resolve(config.soulFile || join(process.cwd(), 'AGENTS.md'))
+  const cwd = process.cwd()
+  // 路径解析走纯函数（src/pure.ts）——环境读取留在这一行，决策可离线单测
+  const { checkpointDir, storagesDir, soulFile } = resolvePaths(config, { dshHome: process.env.DSH_HOME || '', cwd })
 
-  const stamp = (): string => {
-    const d = new Date()
-    const p = (n: number): string => String(n).padStart(2, '0')
-    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
-  }
+  const stamp = (): string => formatStamp(new Date())
 
   /** 存档目标：storages 下全部 json + 灵魂文件 */
   async function snapshotTargets(): Promise<Array<{ rel: string; abs: string }>> {
@@ -199,7 +184,7 @@ export function apply(ctx: Context, config: Config): void {
     const keep = keepOverride ?? config.keepCount
     const list = await listCheckpoints()
     let removed = 0
-    for (const c of list.slice(keep)) {
+    for (const c of selectStaleCheckpoints(list, keep)) {
       try { await rm(c.path, { recursive: true, force: true }); removed += 1 } catch { /* 忽略 */ }
     }
     if (removed > 0) logger.info(`清理旧存档 ${removed} 个`)
@@ -208,28 +193,30 @@ export function apply(ctx: Context, config: Config): void {
 
   async function restoreCheckpoint(id: string | null): Promise<{ restored: string; backedUp: string[]; issues: string[] }> {
     const list = await listCheckpoints()
-    let target = id ? list.find((c) => c.id === id) : undefined
-    if (!target && !id) {
-      for (const c of list) {
-        if ((await verifyCheckpoint(c.id)).healthy) { target = c; break }
+    let target: { id: string; path: string; createdAt: string; reason?: string } | undefined
+    const plan = planRestore(list.map((c) => c.id), id)
+    if (plan.kind === 'by-id') {
+      target = list.find((c) => c.id === plan.id)
+    } else if (plan.kind === 'first-healthy') {
+      for (const candidateId of plan.candidates) {
+        if ((await verifyCheckpoint(candidateId)).healthy) { target = list.find((c) => c.id === candidateId); break }
       }
     }
-    if (!target) throw new Error(`无可用存档点${id ? `（id=${id}）` : '（无健康存档）'}`)
+    if (!target) throw new Error(plan.kind === 'missing' ? plan.message : `无可用存档点（id=${id}）`)
     const manifest = JSON.parse(await readFile(join(target.path, 'manifest.json'), 'utf8')) as Manifest
     const backupDir = join(checkpointDir, `.pre-restore-${stamp()}`)
     await mkdir(backupDir, { recursive: true })
     const backedUp: string[] = []
     const issues: string[] = []
+    const paths = { checkpointDir, storagesDir, soulFile }
     for (const rel of Object.keys(manifest.files ?? {})) {
       const src = join(target.path, 'files', rel)
-      let dst: string
-      if (rel.startsWith('storages/')) dst = join(storagesDir, rel.slice('storages/'.length))
-      else if (rel === 'AGENTS.md') dst = soulFile
-      else continue
+      const dst = restoreDest(rel, paths)
+      if (dst === null) continue
       try {
         await mkdir(dirname(dst), { recursive: true })
         if (existsSync(dst)) {
-          const bak = join(backupDir, rel.replaceAll('/', '__'))
+          const bak = join(backupDir, backupFileName(rel))
           await copyFile(dst, bak)
           backedUp.push(bak)
         }
@@ -346,7 +333,7 @@ export function apply(ctx: Context, config: Config): void {
       // 启动补档：距最近存档已超周期 → 立即补（重启吞 timer 的自愈）
       void lastAnyCheckpointAt().then((last) => {
         const elapsed = Date.now() - last
-        if (last === 0 || elapsed >= config.autoIntervalMs) {
+        if (shouldAutoBackfill(last, Date.now(), config.autoIntervalMs)) {
           logger.info(`启动补档：距最近存档 ${last === 0 ? '无记录' : Math.round(elapsed / 3600_000) + 'h'} ≥ 周期 ${Math.round(config.autoIntervalMs / 3600_000)}h——立即 auto 存档`)
           doAuto()
         } else {
